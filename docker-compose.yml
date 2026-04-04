@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:14
+    container_name: traffic_postgres
+    environment:
+      POSTGRES_DB: transport_analytics
+      POSTGRES_USER: transport_user
+      POSTGRES_PASSWORD: transport_pass
+    ports:
+      - "55432:5432"
+    volumes:
+      - ./artifacts/docker_pgdata:/var/lib/postgresql/data
+      - ./sql/init:/docker-entrypoint-initdb.d:ro
+    restart: unless-stopped
+

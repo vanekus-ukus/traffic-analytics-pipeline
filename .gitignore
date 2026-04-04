@@ -1,0 +1,57 @@
+# Local environment
+.env
+.venv/
+.python-version
+.sentry-native/
+
+# Local PostgreSQL runtime
+.local_pg/
+*.pid
+*.sock
+
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# Generated runtime data
+artifacts/
+data_cache/
+datasets/
+assets/readme/*.jpg
+assets/readme/*.png
+assets/readme/*.gif
+!assets/readme/demo-road.jpg
+!assets/readme/demo-live.jpg
+!assets/readme/demo-stream.gif
+
+# Private source materials not intended for repo
+/docs/
+/data/**
+
+# Large local video inputs
+/data/*.mp4
+/data/*.MP4
+
+# Model weights and downloaded binaries
+*.pt
+*.onnx
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.part
+*.ts
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*~
