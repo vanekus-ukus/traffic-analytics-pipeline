@@ -53,10 +53,36 @@ def _build_ffmpeg_stream(
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
 
+def _build_ffplay_sink(output_width: int, output_height: int, fps: int) -> subprocess.Popen[bytes]:
+    cmd = [
+        "ffplay",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-f",
+        "rawvideo",
+        "-pixel_format",
+        "bgr24",
+        "-video_size",
+        f"{output_width}x{output_height}",
+        "-framerate",
+        str(max(fps, 1)),
+        "-window_title",
+        "traffic_live_view",
+        "-",
+    ]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def _draw_frame(
     frame: np.ndarray,
     rows: list[dict[str, object]],
-    class_counts: Counter[str],
+    frame_class_counts: Counter[str],
+    cumulative_track_counts: Counter[str],
     model_name: str,
 ) -> np.ndarray:
     output = frame.copy()
@@ -78,10 +104,12 @@ def _draw_frame(
             cv2.LINE_AA,
         )
 
-    stats = ", ".join(f"{name}={value}" for name, value in sorted(class_counts.items())) or "-"
-    cv2.rectangle(output, (12, 12), (output.shape[1] - 12, 86), (25, 25, 25), -1)
+    frame_stats = ", ".join(f"{name}={value}" for name, value in sorted(frame_class_counts.items())) or "-"
+    total_stats = ", ".join(f"{name}={value}" for name, value in sorted(cumulative_track_counts.items())) or "-"
+    cv2.rectangle(output, (12, 12), (output.shape[1] - 12, 120), (25, 25, 25), -1)
     cv2.putText(output, f"model={model_name}", (24, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-    cv2.putText(output, f"frame_counts: {stats}", (24, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(output, f"frame_counts: {frame_stats}", (24, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(output, f"total_tracks: {total_stats}", (24, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     return output
 
 
@@ -123,6 +151,7 @@ def run() -> None:
     parser.add_argument("--display-height", type=int, default=720)
     parser.add_argument("--max-seconds", type=int, default=0)
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--renderer", choices=["auto", "opencv", "ffplay"], default="auto")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -156,8 +185,26 @@ def run() -> None:
     frame_size = output_width * output_height * 3
     frame_index = 0
     started = time.monotonic()
+    seen_track_ids: set[str] = set()
+    cumulative_track_counts: Counter[str] = Counter()
+    use_opencv_window = False
+    ffplay_sink: subprocess.Popen[bytes] | None = None
     if not args.headless:
-        cv2.namedWindow("traffic_live_view", cv2.WINDOW_NORMAL)
+        preferred_renderer = args.renderer
+        if preferred_renderer in {"auto", "opencv"}:
+            try:
+                cv2.namedWindow("traffic_live_view", cv2.WINDOW_NORMAL)
+                use_opencv_window = True
+                LOGGER.info("viewer renderer | opencv")
+            except cv2.error as exc:
+                if preferred_renderer == "opencv":
+                    raise
+                LOGGER.warning("OpenCV GUI is unavailable, falling back to ffplay: %s", exc)
+        if not use_opencv_window:
+            ffplay_sink = _build_ffplay_sink(output_width, output_height, settings.stream_target_fps)
+            if ffplay_sink.stdin is None:
+                raise RuntimeError("ffplay stdin is not available")
+            LOGGER.info("viewer renderer | ffplay")
 
     try:
         while True:
@@ -183,12 +230,18 @@ def run() -> None:
                 xyxy = result.boxes.xyxy.cpu().numpy()
                 confs = result.boxes.conf.cpu().numpy()
                 classes = result.boxes.cls.cpu().numpy().astype(int)
-                for box, conf, cls_id in zip(xyxy, confs, classes):
+                track_ids = (
+                    result.boxes.id.int().cpu().numpy().tolist()
+                    if result.boxes.id is not None
+                    else [None] * len(classes)
+                )
+                for box, conf, cls_id, track_id in zip(xyxy, confs, classes, track_ids):
                     raw_name = COCO_TARGETS.get(int(cls_id), str(int(cls_id)))
                     vehicle_class = map_vehicle_class(raw_name)
                     x1, y1, x2, y2 = map(float, box.tolist())
                     frame_rows.append(
                         {
+                            "track_id": f"trk_{track_id}" if track_id is not None else None,
                             "vehicle_class": vehicle_class,
                             "confidence": float(conf),
                             "bbox_x1": x1,
@@ -199,23 +252,52 @@ def run() -> None:
                     )
 
             frame_rows = _filter_rows(frame_rows, output_width, output_height, settings)
-            class_counts = Counter(str(row["vehicle_class"]) for row in frame_rows)
-            rendered = _draw_frame(frame, frame_rows, class_counts, Path(settings.yolo_model_path).name)
+            frame_class_counts = Counter(str(row["vehicle_class"]) for row in frame_rows)
+            for row in frame_rows:
+                track_id = row.get("track_id")
+                vehicle_class = str(row["vehicle_class"])
+                if track_id and track_id not in seen_track_ids:
+                    seen_track_ids.add(track_id)
+                    cumulative_track_counts[vehicle_class] += 1
+            rendered = _draw_frame(
+                frame,
+                frame_rows,
+                frame_class_counts,
+                cumulative_track_counts,
+                Path(settings.yolo_model_path).name,
+            )
 
             if frame_index % max(settings.stream_target_fps, 1) == 0:
-                LOGGER.info("live frame | t=%ss | frame_counts=%s", int(time.monotonic() - started), dict(class_counts))
+                LOGGER.info(
+                    "live frame | t=%ss | frame_counts=%s | total_tracks=%s",
+                    int(time.monotonic() - started),
+                    dict(frame_class_counts),
+                    dict(cumulative_track_counts),
+                )
 
-            if not args.headless:
+            if use_opencv_window:
                 cv2.imshow("traffic_live_view", rendered)
                 key = cv2.waitKey(1) & 0xFF
                 if key in {27, ord("q")}:
+                    break
+            elif ffplay_sink is not None:
+                try:
+                    ffplay_sink.stdin.write(rendered.tobytes())
+                    ffplay_sink.stdin.flush()
+                except (BrokenPipeError, OSError):
                     break
             frame_index += 1
     finally:
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
-        if not args.headless:
+        if ffplay_sink is not None:
+            if ffplay_sink.stdin is not None:
+                ffplay_sink.stdin.close()
+            if ffplay_sink.poll() is None:
+                ffplay_sink.kill()
+                ffplay_sink.wait(timeout=5)
+        if use_opencv_window:
             cv2.destroyAllWindows()
 
 

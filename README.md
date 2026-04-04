@@ -62,6 +62,10 @@ Live-просмотр:
 bash scripts/run_live_view.sh --source "<video_or_stream_source>"
 ```
 
+В окне и в консоли показываются:
+- `frame_counts` - объекты на текущем кадре
+- `total_tracks` - накопительный счётчик уникальных объектов с начала запуска
+
 ## Что пишется в БД
 Таблицы:
 - `ops.pipeline_runs`
