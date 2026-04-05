@@ -8,6 +8,7 @@
 - video pipeline на `YOLO Ultralytics`
 - live viewer для визуального мониторинга
 - витрины для BI
+- автоматическое извлечение playable stream из прямых media URL и поддерживаемых HTML player pages
 
 ## Схема работы
 ```mermaid

@@ -4,8 +4,10 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
+import re
 import subprocess
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 
 from sqlalchemy import text
 
@@ -122,6 +124,41 @@ def _resolve_page_url_with_ytdlp(url: str) -> str | None:
         return None
 
 
+def _fetch_text(url: str) -> str | None:
+    try:
+        request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(request, timeout=15) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        LOGGER.warning("Failed to fetch %s: %s", url, exc)
+        return None
+
+
+def _resolve_page_url_from_player_config(url: str) -> MediaRequest | None:
+    html = _fetch_text(url)
+    if not html:
+        return None
+    match = re.search(r'<script[^>]+src="([^"]*config\.js)"', html, flags=re.IGNORECASE)
+    if not match:
+        return None
+    config_url = urljoin(url, match.group(1))
+    config_text = _fetch_text(config_url)
+    if not config_text:
+        return None
+    json_match = re.search(r"playerConfig\s*=\s*(\{.*\})\s*;?\s*$", config_text.strip(), flags=re.DOTALL)
+    if not json_match:
+        return None
+    try:
+        payload = json.loads(json_match.group(1))
+    except json.JSONDecodeError:
+        return None
+    source_path = payload.get("source")
+    if not isinstance(source_path, str) or not source_path:
+        return None
+    media_url = urljoin(url, source_path)
+    return MediaRequest(url=media_url, headers={}, source_type="remote_page_direct")
+
+
 def resolve_media_url(url: str) -> str | None:
     if _is_url(url) and _looks_like_direct_media_url(url):
         return _resolve_direct_url(url)
@@ -150,6 +187,9 @@ def resolve_media_request(url: str) -> MediaRequest | None:
             return MediaRequest(url=media_url, headers=headers, source_type="remote_page_direct")
     except Exception as exc:
         LOGGER.warning("Failed to resolve media request via yt-dlp metadata: %s", exc)
+    config_request = _resolve_page_url_from_player_config(url)
+    if config_request:
+        return config_request
     resolved = _resolve_page_url_with_ytdlp(url)
     return MediaRequest(url=resolved, headers={}, source_type="remote_page_direct") if resolved else None
 
@@ -203,6 +243,9 @@ def resolve_media_candidates(url: str) -> list[MediaRequest]:
                 candidates.append(request)
     except Exception as exc:
         LOGGER.warning("Failed to resolve media candidates via yt-dlp metadata: %s", exc)
+        config_request = _resolve_page_url_from_player_config(url)
+        if config_request:
+            return [config_request]
         fallback = resolve_media_request(url)
         return [fallback] if fallback else []
 

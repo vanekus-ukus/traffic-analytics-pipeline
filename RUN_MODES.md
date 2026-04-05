@@ -32,6 +32,11 @@ bash scripts/run_live_stream.sh --source "<video_or_stream_source>"
 bash scripts/run_live_view.sh --source "<video_or_stream_source>"
 ```
 
+`<video_or_stream_source>` может быть:
+- локальным видеофайлом
+- прямым media URL
+- HTML-страницей с поддерживаемым player config
+
 В окне и в консоли показываются:
 - `frame_counts`
 - `active_tracks`

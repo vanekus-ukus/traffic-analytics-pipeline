@@ -15,7 +15,7 @@
 - обновляет BI-представления
 
 ### Streaming
-- принимает локальный файл, media URL или page URL
+- принимает локальный файл, media URL или поддерживаемый page URL
 - запускает YOLO Ultralytics
 - пишет события в `core.detection_events`
 - считает оконные метрики в `dm.streaming_metrics`
