@@ -52,7 +52,6 @@ class Settings:
     live_track_stitch_distance_px: float
     live_track_stitch_gap_seconds: float
     live_track_state_ttl_seconds: float
-    use_scene_profile: bool
     motion_roi_enabled: bool
     motion_mask_threshold: float
     motion_bbox_min_ratio: float
@@ -137,7 +136,6 @@ def get_settings() -> Settings:
         live_track_stitch_distance_px=float(os.getenv("LIVE_TRACK_STITCH_DISTANCE_PX", "120")),
         live_track_stitch_gap_seconds=float(os.getenv("LIVE_TRACK_STITCH_GAP_SECONDS", "20")),
         live_track_state_ttl_seconds=float(os.getenv("LIVE_TRACK_STATE_TTL_SECONDS", "60")),
-        use_scene_profile=os.getenv("TRAFFIC_USE_SCENE_PROFILE", "0") == "1",
         motion_roi_enabled=os.getenv("TRAFFIC_MOTION_ROI_ENABLED", "1") == "1",
         motion_mask_threshold=float(os.getenv("TRAFFIC_MOTION_MASK_THRESHOLD", "0.03")),
         motion_bbox_min_ratio=float(os.getenv("TRAFFIC_MOTION_BBOX_MIN_RATIO", "0.02")),

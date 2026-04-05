@@ -79,7 +79,6 @@ def run() -> None:
         "window_minutes": settings.stream_window_minutes,
         "yolo_model_path": str(settings.yolo_model_path),
         "stream_target_fps": settings.stream_target_fps,
-        "use_scene_profile": settings.use_scene_profile,
         "motion_roi_enabled": settings.motion_roi_enabled,
     }
     run_id = start_pipeline_run(

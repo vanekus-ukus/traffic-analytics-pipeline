@@ -12,7 +12,6 @@ from ultralytics import YOLO
 
 from traffic_analytics.common.vehicle_mapping import map_vehicle_class
 from traffic_analytics.config.settings import Settings
-from traffic_analytics.training.scene_profile import build_scene_profile, save_scene_profile
 
 LOGGER = logging.getLogger(__name__)
 
@@ -311,11 +310,6 @@ def detect_and_track_video(
         max_frames = max(1, round((settings.stream_max_seconds * effective_fps) / frame_step))
 
     model = YOLO(str(settings.yolo_model_path))
-    scene_profile = None
-    if settings.use_scene_profile:
-        scene_profile = build_scene_profile(settings.tracking_fallback, settings.stream_target_fps)
-        save_scene_profile(scene_profile, settings.artifacts_dir / "calibration" / "historical_scene_profile.json")
-
     motion_mask = None
     if settings.motion_roi_enabled:
         motion_mask = build_motion_mask(
@@ -366,8 +360,6 @@ def detect_and_track_video(
             for box, conf, cls_id, track_id in zip(xyxy, confs, classes, ids):
                 raw_name = COCO_TARGETS.get(int(cls_id), str(int(cls_id)))
                 vehicle_class = map_vehicle_class(raw_name)
-                if scene_profile is not None:
-                    vehicle_class = scene_profile.class_remap_for_inference.get(vehicle_class, vehicle_class)
                 x1, y1, x2, y2 = map(float, box.tolist())
                 bbox_w = max(1.0, x2 - x1)
                 bbox_h = max(1.0, y2 - y1)

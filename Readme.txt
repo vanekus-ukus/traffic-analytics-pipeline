@@ -11,3 +11,9 @@ bash scripts/run_live_stream.sh --source "<video_or_stream_source>"
 
 Просмотр:
 bash scripts/run_live_view.sh --source "<video_or_stream_source>"
+
+Счётчики viewer:
+- frame_counts
+- active_tracks
+- lifetime_tracks
+- new_last_10s

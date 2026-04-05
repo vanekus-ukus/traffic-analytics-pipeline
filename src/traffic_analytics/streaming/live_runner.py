@@ -219,7 +219,6 @@ def run() -> None:
         "live_runtime_seconds": settings.live_runtime_seconds,
         "stream_target_fps": settings.stream_target_fps,
         "motion_roi_enabled": settings.motion_roi_enabled,
-        "use_scene_profile": settings.use_scene_profile,
         "segment_root": str(segment_root),
     }
     if db_enabled and engine is not None:
