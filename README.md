@@ -67,6 +67,7 @@ bash scripts/run_live_view.sh --source "<video_or_stream_source>"
 - `active_tracks` - активные подтверждённые объекты
 - `lifetime_tracks` - суммарный счётчик объектов с начала запуска
 - `new_last_10s` - новые объекты за последние 10 секунд
+- `top_speed` - самое быстрое активное ТС в текущий момент
 
 Пример под быструю дорогу:
 ```bash
@@ -82,6 +83,10 @@ bash scripts/run_live_view.sh \
 - `--target-fps` - частота кадров для обработки
 - `--imgsz` - размер входа модели
 - `--confidence` - порог детекции
+- `--speed-smoothing-alpha` - сглаживание оценки скорости по треку
+- `--speed-kmh-factor` - коэффициент перевода proxy speed в примерный km/h
+- `--speed-window-seconds` - окно истории для устойчивой оценки скорости
+- `--speed-max-jump-ratio` - ограничение резких скачков скорости между окнами
 
 Калибровка счётчика:
 - `--stitch-gap-seconds` - сколько времени держать трек живым

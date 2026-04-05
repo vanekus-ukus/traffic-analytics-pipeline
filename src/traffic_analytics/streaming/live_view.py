@@ -40,6 +40,10 @@ class LiveTrackState:
     bbox_x2: float
     bbox_y2: float
     touches_edge: bool
+    speed_px_per_sec: float = 0.0
+    speed_kmh_estimated: float = 0.0
+    position_history: deque[tuple[float, float, float]] = field(default_factory=lambda: deque(maxlen=32))
+    speed_samples: deque[float] = field(default_factory=lambda: deque(maxlen=12))
     class_votes: Counter[str] = field(default_factory=Counter)
     class_history: deque[tuple[str, float, float]] = field(default_factory=lambda: deque(maxlen=24))
     counted: bool = False
@@ -75,6 +79,10 @@ class ViewerTuning:
     static_movement_px: float = 20.0
     static_min_hits: int = 10
     suppression_padding_px: float = 20.0
+    speed_smoothing_alpha: float = 0.35
+    speed_kmh_factor: float = 0.18
+    speed_window_seconds: float = 2.0
+    speed_max_jump_ratio: float = 2.4
 
 
 def _class_family(vehicle_class: str) -> str:
@@ -158,6 +166,55 @@ def _stable_track_counts(track_states: dict[str, LiveTrackState]) -> Counter[str
         if state.counted:
             counts[state.stable_class] += 1
     return counts
+
+
+def _top_speed_track(track_states: dict[str, LiveTrackState]) -> LiveTrackState | None:
+    candidates = [state for state in track_states.values() if state.counted and state.speed_px_per_sec > 0]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda state: state.speed_px_per_sec)
+
+
+def _update_track_speed(state: LiveTrackState, now_ts: float, tuning: ViewerTuning) -> None:
+    state.position_history.append((now_ts, state.centroid_x, state.centroid_y))
+    cutoff = now_ts - tuning.speed_window_seconds
+    while len(state.position_history) > 2 and state.position_history[0][0] < cutoff:
+        state.position_history.popleft()
+
+    instant_speed: float | None = None
+    if now_ts > state.last_seen:
+        dt = now_ts - state.last_seen
+        if dt > 0:
+            instant_speed = (
+                ((state.centroid_x - state.prev_centroid_x) ** 2 + (state.centroid_y - state.prev_centroid_y) ** 2) ** 0.5
+            ) / dt
+
+    window_speed: float | None = None
+    if len(state.position_history) >= 2:
+        first_ts, first_x, first_y = state.position_history[0]
+        last_ts, last_x, last_y = state.position_history[-1]
+        window_dt = last_ts - first_ts
+        if window_dt > 0:
+            window_speed = (((last_x - first_x) ** 2 + (last_y - first_y) ** 2) ** 0.5) / window_dt
+
+    candidates = [value for value in (instant_speed, window_speed) if value is not None and value >= 0]
+    if not candidates:
+        return
+
+    raw_speed = float(np.median(candidates))
+    if state.speed_samples:
+        baseline = float(np.median(state.speed_samples))
+        if baseline > 0 and raw_speed > baseline * tuning.speed_max_jump_ratio:
+            raw_speed = baseline * tuning.speed_max_jump_ratio
+    state.speed_samples.append(raw_speed)
+    sample_median = float(np.median(state.speed_samples))
+
+    alpha = min(max(tuning.speed_smoothing_alpha, 0.0), 1.0)
+    if state.speed_px_per_sec <= 0:
+        state.speed_px_per_sec = sample_median
+    else:
+        state.speed_px_per_sec = (alpha * sample_median) + ((1 - alpha) * state.speed_px_per_sec)
+    state.speed_kmh_estimated = state.speed_px_per_sec * tuning.speed_kmh_factor
 
 
 def _row_center_in_zone(row: dict[str, object], zone: dict[str, float]) -> bool:
@@ -308,8 +365,10 @@ def _update_track_states(
                     bbox_y2=float(row["bbox_y2"]),
                     touches_edge=bool(row.get("touches_edge")),
                 )
+                state.position_history.append((now_ts, state.centroid_x, state.centroid_y))
             track_states[global_id] = state
         state.local_track_id = row.get("track_id")
+        prev_seen = state.last_seen
         state.last_seen = now_ts
         state.prev_centroid_x = state.centroid_x
         state.prev_centroid_y = state.centroid_y
@@ -327,6 +386,8 @@ def _update_track_states(
             / max(float(row.get("frame_area", 1.0)), 1.0),
         )
         state.class_history.append((str(row["vehicle_class"]), float(row["confidence"]), bbox_area_ratio))
+        if now_ts > prev_seen:
+            _update_track_speed(state, now_ts, tuning)
         row["stable_track_id"] = global_id
         row["vehicle_class"] = state.stable_class
 
@@ -424,6 +485,7 @@ def _draw_frame(
     active_track_counts: Counter[str],
     lifetime_track_counts: Counter[str],
     recent_entry_counts: Counter[str],
+    top_speed_state: LiveTrackState | None,
     model_name: str,
 ) -> np.ndarray:
     output = frame.copy()
@@ -478,6 +540,30 @@ def _draw_frame(
     for idx, cls in enumerate(classes, start=1):
         y = recent_top + idx * 28
         cv2.putText(canvas, f"{cls}: {recent_entry_counts.get(cls, 0)}", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+    speed_top = recent_top + (len(classes) + 2) * 28
+    cv2.putText(canvas, "top_speed", (x0, speed_top), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (180, 220, 255), 2)
+    if top_speed_state is None:
+        cv2.putText(canvas, "-", (x0, speed_top + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
+    else:
+        cv2.putText(
+            canvas,
+            f"{top_speed_state.stable_class}  {top_speed_state.speed_px_per_sec:.1f} px/s",
+            (x0, speed_top + 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.56,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            canvas,
+            f"~{top_speed_state.speed_kmh_estimated:.1f} km/h est",
+            (x0, speed_top + 62),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.56,
+            (255, 255, 255),
+            2,
+        )
     return canvas
 
 
@@ -541,6 +627,10 @@ def run() -> None:
     parser.add_argument("--static-movement-px", type=float, default=None)
     parser.add_argument("--static-min-hits", type=int, default=None)
     parser.add_argument("--suppression-padding-px", type=float, default=None)
+    parser.add_argument("--speed-smoothing-alpha", type=float, default=None)
+    parser.add_argument("--speed-kmh-factor", type=float, default=None)
+    parser.add_argument("--speed-window-seconds", type=float, default=None)
+    parser.add_argument("--speed-max-jump-ratio", type=float, default=None)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -593,6 +683,14 @@ def run() -> None:
         tuning.static_min_hits = args.static_min_hits
     if args.suppression_padding_px is not None:
         tuning.suppression_padding_px = args.suppression_padding_px
+    if args.speed_smoothing_alpha is not None:
+        tuning.speed_smoothing_alpha = args.speed_smoothing_alpha
+    if args.speed_kmh_factor is not None:
+        tuning.speed_kmh_factor = args.speed_kmh_factor
+    if args.speed_window_seconds is not None:
+        tuning.speed_window_seconds = args.speed_window_seconds
+    if args.speed_max_jump_ratio is not None:
+        tuning.speed_max_jump_ratio = args.speed_max_jump_ratio
     request = resolve_validated_media_request(args.source)
     if request is None:
         raise RuntimeError(f"Unable to resolve a playable stream from {args.source}")
@@ -649,7 +747,7 @@ def run() -> None:
             LOGGER.info("viewer renderer | ffplay")
 
     LOGGER.info(
-        "viewer tuning | fps=%s imgsz=%s conf=%.2f overlap_iou=%.2f stale=%.1fs stitch_gap=%.1fs stitch_dist=%.1f stitch_min_iou=%.2f reid_memory=%.1fs reid_dist=%.1f min_hits=%s edge_hits=%s static_duration=%.1fs static_move=%.1f static_min_hits=%s",
+        "viewer tuning | fps=%s imgsz=%s conf=%.2f overlap_iou=%.2f stale=%.1fs stitch_gap=%.1fs stitch_dist=%.1f stitch_min_iou=%.2f reid_memory=%.1fs reid_dist=%.1f min_hits=%s edge_hits=%s static_duration=%.1fs static_move=%.1f static_min_hits=%s speed_alpha=%.2f speed_factor=%.3f speed_window=%.1fs speed_jump=%.2f",
         settings.stream_target_fps,
         settings.yolo_imgsz,
         settings.yolo_confidence,
@@ -665,6 +763,10 @@ def run() -> None:
         tuning.static_duration_seconds,
         tuning.static_movement_px,
         tuning.static_min_hits,
+        tuning.speed_smoothing_alpha,
+        tuning.speed_kmh_factor,
+        tuning.speed_window_seconds,
+        tuning.speed_max_jump_ratio,
     )
 
     try:
@@ -746,6 +848,7 @@ def run() -> None:
             while recent_entries and recent_entries[0][0] < cutoff:
                 recent_entries.popleft()
             recent_entry_counts = Counter(vehicle_class for _, vehicle_class in recent_entries)
+            top_speed_state = _top_speed_track(track_states)
             rendered = _draw_frame(
                 frame,
                 frame_rows,
@@ -753,17 +856,24 @@ def run() -> None:
                 active_track_counts,
                 lifetime_track_counts,
                 recent_entry_counts,
+                top_speed_state,
                 Path(settings.yolo_model_path).name,
             )
 
             if frame_index % max(settings.stream_target_fps, 1) == 0:
+                top_speed_text = (
+                    f"{top_speed_state.stable_class}:{top_speed_state.speed_px_per_sec:.1f}px/s ~{top_speed_state.speed_kmh_estimated:.1f}km/h"
+                    if top_speed_state is not None
+                    else "-"
+                )
                 LOGGER.info(
-                    "live frame | t=%ss | frame_counts=%s | active_tracks=%s | lifetime_tracks=%s | new_last_10s=%s | suppression_zones=%s",
+                    "live frame | t=%ss | frame_counts=%s | active_tracks=%s | lifetime_tracks=%s | new_last_10s=%s | top_speed=%s | suppression_zones=%s",
                     int(time.monotonic() - started),
                     dict(frame_class_counts),
                     dict(active_track_counts),
                     dict(lifetime_track_counts),
                     dict(recent_entry_counts),
+                    top_speed_text,
                     len(suppression_zones),
                 )
 
