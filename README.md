@@ -133,7 +133,7 @@ psql -h /tmp/traffic_pg_socket -p 55432 -U transport_user -d transport_analytics
 ```
 
 ## Режимы запуска
-Все команды запуска, live viewer, streaming, batch и калибровка параметров вынесены в [RUN_MODES.md](/home/courage/Рабочий стол/CODEX/RUN_MODES.md).
+Все команды запуска, live viewer, streaming, batch и калибровка параметров вынесены в [RUN_MODES.md](RUN_MODES.md).
 
 ## Ограничения
 - качество детекции зависит от сцены и мощности машины
