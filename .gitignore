@@ -25,6 +25,7 @@ htmlcov/
 artifacts/
 data_cache/
 datasets/
+profiles/live_view/*.json
 assets/readme/*.jpg
 assets/readme/*.png
 assets/readme/*.gif

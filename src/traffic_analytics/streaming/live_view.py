@@ -4,10 +4,14 @@ import argparse
 from collections import Counter
 from collections import deque
 from dataclasses import dataclass, field
+import hashlib
+import json
 import logging
 from pathlib import Path
+import re
 import subprocess
 import time
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -21,6 +25,8 @@ from traffic_analytics.streaming.yolo_backend import COCO_TARGETS, VEHICLE_CLASS
 
 LOGGER = logging.getLogger(__name__)
 PANEL_WIDTH = 420
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROFILE_DIR = PROJECT_ROOT / "profiles" / "live_view"
 
 
 @dataclass
@@ -48,6 +54,7 @@ class LiveTrackState:
     class_history: deque[tuple[str, float, float]] = field(default_factory=lambda: deque(maxlen=24))
     counted: bool = False
     counted_class: str | None = None
+    counted_at: float | None = None
     suppressed: bool = False
 
     @property
@@ -77,6 +84,9 @@ class ViewerTuning:
     edge_min_track_hits: int = 1
     person_min_track_hits: int = 3
     person_min_duration_seconds: float = 0.35
+    heavy_vehicle_min_track_hits: int = 4
+    heavy_vehicle_min_duration_seconds: float = 0.8
+    heavy_vehicle_reclassify_seconds: float = 2.5
     static_duration_seconds: float = 6.0
     static_movement_px: float = 20.0
     static_min_hits: int = 10
@@ -90,6 +100,69 @@ class ViewerTuning:
     ghost_zone_min_hits: int = 6
     ghost_zone_window_seconds: float = 20.0
     ghost_zone_radius_px: float = 45.0
+
+
+def _slugify_source(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
+    return cleaned[:80] or "source"
+
+
+def _default_profile_path(source: str) -> Path:
+    parsed = urlparse(source)
+    if parsed.scheme in {"http", "https"}:
+        host = parsed.netloc or "remote"
+        path_bits = [bit for bit in parsed.path.split("/") if bit]
+        suffix = "-".join(path_bits[-2:]) if path_bits else "root"
+        slug = _slugify_source(f"{host}-{suffix}")
+    else:
+        slug = _slugify_source(Path(source).stem)
+    digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:10]
+    return PROFILE_DIR / f"{slug}-{digest}.json"
+
+
+def _load_profile(profile_path: Path) -> dict[str, object] | None:
+    if not profile_path.exists():
+        return None
+    try:
+        return json.loads(profile_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        LOGGER.warning("Failed to load source profile %s: %s", profile_path, exc)
+        return None
+
+
+def _apply_profile(settings, tuning: ViewerTuning, payload: dict[str, object]) -> None:
+    profile_settings = payload.get("settings", {})
+    if isinstance(profile_settings, dict):
+        if "target_fps" in profile_settings:
+            settings.stream_target_fps = int(profile_settings["target_fps"])
+        if "imgsz" in profile_settings:
+            settings.yolo_imgsz = int(profile_settings["imgsz"])
+        if "confidence" in profile_settings:
+            settings.yolo_confidence = float(profile_settings["confidence"])
+    profile_tuning = payload.get("tuning", {})
+    if not isinstance(profile_tuning, dict):
+        return
+    for field_name in ViewerTuning.__dataclass_fields__:
+        if field_name in profile_tuning:
+            setattr(tuning, field_name, profile_tuning[field_name])
+
+
+def _save_profile(profile_path: Path, source: str, scene_preset: str, settings, tuning: ViewerTuning) -> None:
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "source": source,
+        "scene_preset": scene_preset,
+        "settings": {
+            "target_fps": settings.stream_target_fps,
+            "imgsz": settings.yolo_imgsz,
+            "confidence": settings.yolo_confidence,
+        },
+        "tuning": {
+            field_name: getattr(tuning, field_name)
+            for field_name in ViewerTuning.__dataclass_fields__
+        },
+    }
+    profile_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _class_family(vehicle_class: str) -> str:
@@ -114,10 +187,23 @@ def _should_upgrade_counted_class(old_class: str | None, new_class: str) -> bool
 def _reclassify_counted_track(
     state: LiveTrackState,
     lifetime_track_counts: Counter[str],
+    tuning: ViewerTuning,
+    now_ts: float,
 ) -> None:
     if not state.counted:
         return
-    if not _should_upgrade_counted_class(state.counted_class, state.stable_class):
+    if not state.counted_class or state.counted_class == state.stable_class:
+        return
+    old_class = state.counted_class
+    new_class = state.stable_class
+    within_reclassify_window = (
+        state.counted_at is not None and (now_ts - state.counted_at) <= tuning.heavy_vehicle_reclassify_seconds
+    )
+    if old_class in {"car", "truck", "bus"} and new_class in {"car", "truck", "bus"} and within_reclassify_window:
+        should_reclassify = True
+    else:
+        should_reclassify = _should_upgrade_counted_class(old_class, new_class)
+    if not should_reclassify:
         return
     previous_class = state.counted_class
     if previous_class and lifetime_track_counts.get(previous_class, 0) > 0:
@@ -354,6 +440,12 @@ def _should_count_track(state: LiveTrackState, hits: int, tuning: ViewerTuning) 
     if stable_class == "person":
         required_hits = tuning.person_min_track_hits
         return hits >= required_hits and duration >= tuning.person_min_duration_seconds
+    if stable_class in {"truck", "bus"}:
+        required_hits = max(
+            tuning.edge_min_track_hits if state.touches_edge else tuning.min_track_hits,
+            tuning.heavy_vehicle_min_track_hits,
+        )
+        return hits >= required_hits and duration >= tuning.heavy_vehicle_min_duration_seconds
     required_hits = tuning.edge_min_track_hits if state.touches_edge else tuning.min_track_hits
     return hits >= required_hits
 
@@ -549,6 +641,7 @@ def _update_track_states(
             if _should_count_track(state, hits, tuning):
                 state.counted = True
                 state.counted_class = state.stable_class
+                state.counted_at = now_ts
         duration = state.last_seen - state.first_seen
         total_displacement = (
             (state.centroid_x - state.first_centroid_x) ** 2 + (state.centroid_y - state.first_centroid_y) ** 2
@@ -759,6 +852,8 @@ def _filter_rows(
 def run() -> None:
     parser = argparse.ArgumentParser(description="Open live preview with detections over the incoming stream.")
     parser.add_argument("--source", required=True)
+    parser.add_argument("--profile-path", default=None)
+    parser.add_argument("--no-auto-profile", action="store_true")
     parser.add_argument("--display-height", type=int, default=720)
     parser.add_argument("--max-seconds", type=int, default=0)
     parser.add_argument("--headless", action="store_true")
@@ -778,6 +873,9 @@ def run() -> None:
     parser.add_argument("--edge-min-track-hits", type=int, default=None)
     parser.add_argument("--person-min-track-hits", type=int, default=None)
     parser.add_argument("--person-min-duration-seconds", type=float, default=None)
+    parser.add_argument("--heavy-vehicle-min-track-hits", type=int, default=None)
+    parser.add_argument("--heavy-vehicle-min-duration-seconds", type=float, default=None)
+    parser.add_argument("--heavy-vehicle-reclassify-seconds", type=float, default=None)
     parser.add_argument("--static-duration-seconds", type=float, default=None)
     parser.add_argument("--static-movement-px", type=float, default=None)
     parser.add_argument("--static-min-hits", type=int, default=None)
@@ -797,12 +895,7 @@ def run() -> None:
     configure_logging(args.log_level)
     settings = get_settings()
     _apply_scene_preset(settings, args.scene_preset)
-    if args.target_fps is not None:
-        settings.stream_target_fps = args.target_fps
-    if args.imgsz is not None:
-        settings.yolo_imgsz = args.imgsz
-    if args.confidence is not None:
-        settings.yolo_confidence = args.confidence
+    profile_path = Path(args.profile_path) if args.profile_path else _default_profile_path(args.source)
     tuning = ViewerTuning()
     if args.scene_preset == "fast_road":
         tuning.track_stale_seconds = 4.0
@@ -815,6 +908,9 @@ def run() -> None:
         tuning.edge_min_track_hits = 1
         tuning.person_min_track_hits = 3
         tuning.person_min_duration_seconds = 0.35
+        tuning.heavy_vehicle_min_track_hits = 4
+        tuning.heavy_vehicle_min_duration_seconds = 0.8
+        tuning.heavy_vehicle_reclassify_seconds = 2.5
         tuning.static_duration_seconds = 8.0
         tuning.static_movement_px = 24.0
         tuning.static_min_hits = 14
@@ -824,6 +920,17 @@ def run() -> None:
         tuning.ghost_zone_min_hits = 0
         tuning.ghost_zone_window_seconds = 20.0
         tuning.ghost_zone_radius_px = 45.0
+    if not args.no_auto_profile:
+        profile_payload = _load_profile(profile_path)
+        if profile_payload is not None:
+            _apply_profile(settings, tuning, profile_payload)
+            LOGGER.info("Loaded source profile | %s", profile_path)
+    if args.target_fps is not None:
+        settings.stream_target_fps = args.target_fps
+    if args.imgsz is not None:
+        settings.yolo_imgsz = args.imgsz
+    if args.confidence is not None:
+        settings.yolo_confidence = args.confidence
     if args.overlap_iou is not None:
         tuning.overlap_iou_threshold = args.overlap_iou
     if args.track_stale_seconds is not None:
@@ -846,6 +953,12 @@ def run() -> None:
         tuning.person_min_track_hits = args.person_min_track_hits
     if args.person_min_duration_seconds is not None:
         tuning.person_min_duration_seconds = args.person_min_duration_seconds
+    if args.heavy_vehicle_min_track_hits is not None:
+        tuning.heavy_vehicle_min_track_hits = args.heavy_vehicle_min_track_hits
+    if args.heavy_vehicle_min_duration_seconds is not None:
+        tuning.heavy_vehicle_min_duration_seconds = args.heavy_vehicle_min_duration_seconds
+    if args.heavy_vehicle_reclassify_seconds is not None:
+        tuning.heavy_vehicle_reclassify_seconds = args.heavy_vehicle_reclassify_seconds
     if args.static_duration_seconds is not None:
         tuning.static_duration_seconds = args.static_duration_seconds
     if args.static_movement_px is not None:
@@ -872,6 +985,9 @@ def run() -> None:
         tuning.ghost_zone_window_seconds = args.ghost_zone_window_seconds
     if args.ghost_zone_radius_px is not None:
         tuning.ghost_zone_radius_px = args.ghost_zone_radius_px
+    if not args.no_auto_profile:
+        _save_profile(profile_path, args.source, args.scene_preset, settings, tuning)
+        LOGGER.info("Saved source profile | %s", profile_path)
     request = resolve_validated_media_request(args.source)
     if request is None:
         raise RuntimeError(f"Unable to resolve a playable stream from {args.source}")
@@ -929,7 +1045,7 @@ def run() -> None:
             LOGGER.info("viewer renderer | ffplay")
 
     LOGGER.info(
-        "viewer tuning | fps=%s imgsz=%s conf=%.2f overlap_iou=%.2f stale=%.1fs stitch_gap=%.1fs stitch_dist=%.1f stitch_min_iou=%.2f reid_memory=%.1fs reid_dist=%.1f min_hits=%s edge_hits=%s person_hits=%s person_duration=%.2fs static_duration=%.1fs static_move=%.1f static_min_hits=%s speed_alpha=%.2f speed_factor=%.3f speed_window=%.1fs speed_jump=%.2f speed_reset=%.2fs speed_cap=%.1f ghost_hits=%s ghost_window=%.1fs ghost_radius=%.1f",
+        "viewer tuning | fps=%s imgsz=%s conf=%.2f overlap_iou=%.2f stale=%.1fs stitch_gap=%.1fs stitch_dist=%.1f stitch_min_iou=%.2f reid_memory=%.1fs reid_dist=%.1f min_hits=%s edge_hits=%s person_hits=%s person_duration=%.2fs heavy_hits=%s heavy_duration=%.2fs heavy_reclass=%.2fs static_duration=%.1fs static_move=%.1f static_min_hits=%s speed_alpha=%.2f speed_factor=%.3f speed_window=%.1fs speed_jump=%.2f speed_reset=%.2fs speed_cap=%.1f ghost_hits=%s ghost_window=%.1fs ghost_radius=%.1f",
         settings.stream_target_fps,
         settings.yolo_imgsz,
         settings.yolo_confidence,
@@ -944,6 +1060,9 @@ def run() -> None:
         tuning.edge_min_track_hits,
         tuning.person_min_track_hits,
         tuning.person_min_duration_seconds,
+        tuning.heavy_vehicle_min_track_hits,
+        tuning.heavy_vehicle_min_duration_seconds,
+        tuning.heavy_vehicle_reclassify_seconds,
         tuning.static_duration_seconds,
         tuning.static_movement_px,
         tuning.static_min_hits,
@@ -1031,7 +1150,7 @@ def run() -> None:
             active_track_counts = _stable_track_counts(track_states)
             frame_class_counts = Counter(str(row["vehicle_class"]) for row in frame_rows)
             for state in track_states.values():
-                _reclassify_counted_track(state, lifetime_track_counts)
+                _reclassify_counted_track(state, lifetime_track_counts, tuning, now_ts)
                 if state.counted and state.global_track_id not in before_counted:
                     counted_class = state.counted_class or state.stable_class
                     recent_entries.append((now_ts, counted_class))

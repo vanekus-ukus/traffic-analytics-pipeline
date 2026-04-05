@@ -44,6 +44,13 @@ bash scripts/run_live_view.sh --source "<video_or_stream_source>"
 - `new_last_10s`
 - `top_speed`
 
+Для каждого источника viewer автоматически сохраняет локальный профиль калибровки в `profiles/live_view/`.
+При следующем запуске этот профиль подхватывается автоматически.
+
+Если нужно:
+- указать свой профиль: `--profile-path "<path_to_profile.json>"`
+- отключить автопрофиль: `--no-auto-profile`
+
 ## Пример под плотный поток
 ```bash
 bash scripts/run_live_view.sh \
