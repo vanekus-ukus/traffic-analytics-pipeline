@@ -56,13 +56,6 @@ flowchart LR
 - `RUN_MODES.md` - режимы запуска и калибровка
 - `assets/readme/` - демонстрационные изображения
 
-## Примеры
-![demo road](assets/readme/demo-road.jpg)
-
-![demo live](assets/readme/demo-live.jpg)
-
-![demo stream](assets/readme/demo-stream.gif)
-
 ## База данных
 Схемы:
 - `raw`
