@@ -333,7 +333,7 @@ def _iter_requested_sources(settings: Settings) -> list[str]:
 
 
 def resolve_video_source(settings: Settings) -> VideoResolution:
-    fallback = settings.video_fallback
+    fallback = settings.video_fallback or settings.vk_cache_path
     requested_sources = _iter_requested_sources(settings)
 
     for requested in requested_sources:

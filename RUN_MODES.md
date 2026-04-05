@@ -8,6 +8,8 @@ bash scripts/start_postgres.sh
 bash scripts/init_db.sh
 ```
 
+Перед batch и fallback-режимами нужно указать свои пути во `.env`.
+
 ## Batch
 ```bash
 bash scripts/run_batch.sh

@@ -12,6 +12,15 @@ def _parse_source_pool(raw_value: str) -> tuple[str, ...]:
     return tuple(items)
 
 
+def _optional_path(raw_value: str | None) -> Path | None:
+    if raw_value is None:
+        return None
+    value = raw_value.strip()
+    if not value:
+        return None
+    return Path(value)
+
+
 @dataclass(slots=True)
 class Settings:
     db_host: str
@@ -25,9 +34,9 @@ class Settings:
     stream_source: str
     stream_source_pool: tuple[str, ...]
     vk_url: str
-    video_fallback: Path
-    tracking_fallback: Path
-    batch_traffic_csv: Path
+    video_fallback: Path | None
+    tracking_fallback: Path | None
+    batch_traffic_csv: Path | None
     artifacts_dir: Path
     stream_window_minutes: int
     batch_camera_id: str
@@ -105,13 +114,9 @@ def get_settings() -> Settings:
         ),
         stream_source_pool=_parse_source_pool(os.getenv("TRAFFIC_STREAM_SOURCE_POOL", "")),
         vk_url=os.getenv("TRAFFIC_VK_URL", ""),
-        video_fallback=Path(os.getenv("TRAFFIC_VIDEO_FALLBACK", "data/input.mp4")),
-        tracking_fallback=Path(
-            os.getenv("TRAFFIC_TRACKING_FALLBACK", "data/tracking.csv")
-        ),
-        batch_traffic_csv=Path(
-            os.getenv("TRAFFIC_BATCH_TRAFFIC", "data/traffic.csv")
-        ),
+        video_fallback=_optional_path(os.getenv("TRAFFIC_VIDEO_FALLBACK")),
+        tracking_fallback=_optional_path(os.getenv("TRAFFIC_TRACKING_FALLBACK")),
+        batch_traffic_csv=_optional_path(os.getenv("TRAFFIC_BATCH_TRAFFIC")),
         artifacts_dir=Path(os.getenv("TRAFFIC_ARTIFACTS_DIR", "artifacts")),
         stream_window_minutes=int(os.getenv("TRAFFIC_STREAM_WINDOW_MINUTES", "1")),
         batch_camera_id=os.getenv("TRAFFIC_BATCH_CAMERA_ID", "historical_camera_1"),

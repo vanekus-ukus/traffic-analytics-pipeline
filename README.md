@@ -1,10 +1,10 @@
 # transport-analytics-platform
 
-Локальный проект для обработки дорожного видео и исторических данных.
+Локальный проект для обработки дорожного видео и пользовательских входных данных.
 
 ## Что внутри
 - PostgreSQL со схемами `raw`, `core`, `dm`, `ops`
-- batch-пайплайн для CSV
+- batch-пайплайн для внешних табличных данных
 - video pipeline на `YOLO Ultralytics`
 - live viewer для визуального мониторинга
 - витрины для BI
@@ -25,7 +25,7 @@ flowchart LR
     K[dm.streaming_metrics]
     L[dm.batch_metrics]
     M[BI views]
-    N[Batch CSV]
+    N[External tabular input]
     O[Batch pipeline]
 
     A --> B
@@ -54,7 +54,7 @@ flowchart LR
 - `notebooks/` - notebook с отчётом
 - `ARCHITECTURE.md` - краткая схема
 - `RUN_MODES.md` - режимы запуска и калибровка
-- `assets/readme/` - демонстрационные изображения
+- `.env.example` - шаблон конфигурации входных данных и окружения
 
 ## База данных
 Схемы:
@@ -135,8 +135,10 @@ psql -h /tmp/traffic_pg_socket -p 55432 -U transport_user -d transport_analytics
 ## Режимы запуска
 Все команды запуска, live viewer, streaming, batch и калибровка параметров вынесены в [RUN_MODES.md](RUN_MODES.md).
 
+Репозиторий не включает входные данные. Пути к видео и табличным источникам задаются через параметры запуска и переменные окружения.
+
 ## Ограничения
 - качество детекции зависит от сцены и мощности машины
 - live viewer на CPU при плотном потоке может терять часть объектов
 - стабильность live зависит от доступности потока и `ffmpeg/yt-dlp`
-- исторический CSV не является готовой train-разметкой для YOLO
+- пользовательские табличные входы не являются готовой train-разметкой для YOLO

@@ -136,6 +136,10 @@ def run() -> None:
     args = parser.parse_args()
     configure_logging(args.log_level)
     settings = get_settings()
+    if settings.batch_traffic_csv is None:
+        raise RuntimeError("TRAFFIC_BATCH_TRAFFIC is not configured.")
+    if settings.tracking_fallback is None:
+        raise RuntimeError("TRAFFIC_TRACKING_FALLBACK is not configured.")
     engine = get_engine(settings)
     config_snapshot = {
         "batch_traffic_csv": str(settings.batch_traffic_csv),

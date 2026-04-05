@@ -29,7 +29,8 @@ def cleanup_video_artifacts(resolution, settings) -> list[str]:
     ]
     for candidate in candidates:
         try:
-            if candidate.exists() and candidate.resolve() != settings.video_fallback.resolve():
+            fallback_resolve = settings.video_fallback.resolve() if settings.video_fallback is not None else None
+            if candidate.exists() and candidate.resolve() != fallback_resolve:
                 candidate.unlink()
                 removed.append(str(candidate))
         except FileNotFoundError:
@@ -152,6 +153,8 @@ def run() -> None:
         except Exception as yolo_exc:
             LOGGER.warning("Primary YOLO backend failed: %s", yolo_exc)
             try:
+                if settings.video_fallback is None or not settings.video_fallback.exists():
+                    raise RuntimeError("Local fallback video is not configured.")
                 LOGGER.warning("Retrying YOLO on local fallback video %s", settings.video_fallback)
                 resolution.message = (
                     f"{resolution.message} Primary source failed; YOLO retried on local fallback video."
@@ -211,6 +214,8 @@ def run() -> None:
                     "YOLO backend failed on both primary and local fallback sources, switching to preannotated fallback: %s",
                     local_yolo_exc,
                 )
+                if settings.tracking_fallback is None or not settings.tracking_fallback.exists():
+                    raise RuntimeError("Preannotated fallback is not configured.") from local_yolo_exc
                 backend_name = "preannotated_fallback"
                 events_raw = load_preannotated_events(settings.tracking_fallback, resolution.fps)
                 events = pd.DataFrame(
