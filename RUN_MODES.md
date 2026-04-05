@@ -1,5 +1,7 @@
 # Run Modes
 
+Все команды предполагают запуск из корня репозитория.
+
 ## Базовый запуск
 ```bash
 cp .env.example .env
@@ -97,7 +99,7 @@ bash scripts/run_live_view.sh \
 - `--speed-max-kmh-estimated` - верхний предел оценочной скорости
 
 ## Viewer renderer
-Если OpenCV GUI недоступен, используй:
+Если OpenCV GUI недоступен:
 ```bash
 bash scripts/run_live_view.sh --source "<video_or_stream_source>" --renderer ffplay
 ```

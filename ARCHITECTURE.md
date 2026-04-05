@@ -4,7 +4,7 @@
 - `src/traffic_analytics/` - код пайплайнов и утилит
 - `scripts/` - shell-обёртки запуска
 - `sql/init/` - схемы, таблицы и представления
-- `notebooks/report.ipynb` - короткий отчётный ноутбук
+- `notebooks/report.ipynb` - пример анализа
 
 ## Контуры
 
