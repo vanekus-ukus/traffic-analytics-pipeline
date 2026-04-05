@@ -6,106 +6,71 @@
 - PostgreSQL со схемами `raw`, `core`, `dm`, `ops`
 - batch-пайплайн для CSV
 - video pipeline на `YOLO Ultralytics`
-- live-режим с обработкой коротких сегментов
-- представления для BI
+- live viewer для визуального мониторинга
+- витрины для BI
+
+## Схема работы
+```mermaid
+flowchart LR
+    A[Видеоисточник\nлокальный файл / page URL / media URL]
+    B[Stream resolver\nvalidate + select source]
+    C[Live viewer\nокно + счётчики + top speed]
+    D[Live stream runner\nсегменты + annotated video]
+    E[YOLO detector]
+    F[Track stitching\nclass stabilization\nspeed proxy]
+    G[Event builder]
+    H[(PostgreSQL)]
+    I[core.detection_events]
+    J[core.tracked_objects]
+    K[dm.streaming_metrics]
+    L[dm.batch_metrics]
+    M[BI views]
+    N[Batch CSV]
+    O[Batch pipeline]
+
+    A --> B
+    B --> C
+    B --> D
+    C --> E
+    D --> E
+    E --> F
+    F --> G
+    G --> I
+    F --> J
+    J --> K
+    N --> O
+    O --> L
+    I --> H
+    J --> H
+    K --> H
+    L --> H
+    H --> M
+```
 
 ## Структура
 - `src/` - код
 - `scripts/` - запуск
-- `sql/init/` - SQL
-- `data/` - входные файлы
-- `notebooks/` - ноутбук
+- `sql/init/` - SQL-инициализация
+- `notebooks/` - notebook с отчётом
 - `ARCHITECTURE.md` - краткая схема
-- `assets/readme/` - примеры детекции
+- `RUN_MODES.md` - режимы запуска и калибровка
+- `assets/readme/` - демонстрационные изображения
 
 ## Примеры
-
-Кадр с детекцией:
-
 ![demo road](assets/readme/demo-road.jpg)
-
-Кадр из live-просмотра:
 
 ![demo live](assets/readme/demo-live.jpg)
 
-GIF с live-детекцией:
-
 ![demo stream](assets/readme/demo-stream.gif)
 
-## Запуск
-```bash
-cp .env.example .env
-bash scripts/setup_env.sh
-bash scripts/start_postgres.sh
-bash scripts/init_db.sh
-bash scripts/run_batch.sh
-bash scripts/run_streaming.sh
-```
+## База данных
+Схемы:
+- `raw`
+- `core`
+- `dm`
+- `ops`
 
-Сквозной запуск:
-```bash
-bash scripts/run_all.sh
-```
-
-Остановка БД:
-```bash
-bash scripts/stop_postgres.sh
-```
-
-## Потоковый режим
-```bash
-bash scripts/run_streaming.sh --source "<video_or_stream_source>"
-```
-
-Live-просмотр:
-```bash
-bash scripts/run_live_view.sh --source "<video_or_stream_source>"
-```
-
-В окне и в консоли показываются:
-- `frame_counts` - объекты на текущем кадре
-- `active_tracks` - активные подтверждённые объекты
-- `lifetime_tracks` - суммарный счётчик объектов с начала запуска
-- `new_last_10s` - новые объекты за последние 10 секунд
-- `top_speed` - самое быстрое активное ТС в текущий момент
-
-Пример под быструю дорогу:
-```bash
-bash scripts/run_live_view.sh \
-  --source "<video_or_stream_source>" \
-  --scene-preset fast_road \
-  --renderer ffplay \
-  --log-level INFO
-```
-
-## Настройка viewer
-Основные параметры:
-- `--target-fps` - частота кадров для обработки
-- `--imgsz` - размер входа модели
-- `--confidence` - порог детекции
-- `--speed-smoothing-alpha` - сглаживание оценки скорости по треку
-- `--speed-kmh-factor` - коэффициент перевода proxy speed в примерный km/h
-- `--speed-window-seconds` - окно истории для устойчивой оценки скорости
-- `--speed-max-jump-ratio` - ограничение резких скачков скорости между окнами
-
-Калибровка счётчика:
-- `--stitch-gap-seconds` - сколько времени держать трек живым
-- `--stitch-distance-px` - на каком расстоянии сшивать один и тот же объект
-- `--stitch-min-iou` - минимальное перекрытие bbox для сшивки в плотном потоке
-- `--reid-memory-seconds` - сколько помнить недавно пропавший объект
-- `--reid-distance-px` - на каком расстоянии возвращать пропавший объект в тот же трек
-- `--min-track-hits` - сколько подтверждений нужно новому объекту
-- `--edge-min-track-hits` - отдельный порог для объектов у края кадра
-
-Подавление дублей и статичного мусора:
-- `--overlap-iou` - насколько агрессивно подавлять перекрывающиеся bbox
-- `--static-duration-seconds` - через сколько секунд статичный ложный объект блокируется
-- `--static-movement-px` - какой сдвиг считать почти неподвижным
-- `--static-min-hits` - сколько наблюдений нужно перед блокировкой статичного ложного объекта
-- `--suppression-padding-px` - размер зоны вокруг статичного ложного объекта
-
-## Что пишется в БД
-Таблицы:
+Основные таблицы:
 - `ops.pipeline_runs`
 - `ops.data_quality_checks`
 - `raw.tracking_source_rows`
@@ -115,22 +80,70 @@ bash scripts/run_live_view.sh \
 - `dm.streaming_metrics`
 - `dm.batch_metrics`
 
-Представления:
+Что хранится в `core.detection_events`:
+- `frame_ts`
+- `frame_no`
+- `track_id`
+- `class_name_raw`
+- `vehicle_class`
+- `confidence`
+- `centroid_x`
+- `centroid_y`
+- `bbox_x1`
+- `bbox_y1`
+- `bbox_x2`
+- `bbox_y2`
+- `speed_proxy`
+
+Что хранится в `core.tracked_objects`:
+- `track_id`
+- `vehicle_class`
+- `first_seen_ts`
+- `last_seen_ts`
+- `duration_seconds`
+- `detections_count`
+- `start_centroid_x`
+- `start_centroid_y`
+- `end_centroid_x`
+- `end_centroid_y`
+- `distance_proxy`
+- `speed_proxy`
+- `speed_kmh_estimated`
+
+Витрины:
 - `dm.v_datalens_live_traffic`
 - `dm.v_datalens_historical_traffic`
 - `dm.v_datalens_vehicle_mix`
 - `dm.v_datalens_stream_vs_history`
 - `dm.v_datalens_traffic_all`
 
-## Проверка
+## Метрики
+Streaming и batch слой считают:
+- интенсивность потока
+- состав потока по классам
+- `avg_speed_proxy`
+- `occupancy_proxy`
+- `congestion_proxy`
+- `heavy_vehicle_share`
+
+Важно:
+- координаты в streaming-событиях сейчас хранятся в пикселях кадра
+- скорость по видео считается как proxy / estimate
+- `km/h est` без калибровки камеры не является физически точным измерением
+
+## Проверка БД
 ```bash
 psql -h /tmp/traffic_pg_socket -p 55432 -U transport_user -d transport_analytics -c "SELECT COUNT(*) FROM core.detection_events;"
+psql -h /tmp/traffic_pg_socket -p 55432 -U transport_user -d transport_analytics -c "SELECT COUNT(*) FROM core.tracked_objects;"
 psql -h /tmp/traffic_pg_socket -p 55432 -U transport_user -d transport_analytics -c "SELECT COUNT(*) FROM dm.streaming_metrics;"
 psql -h /tmp/traffic_pg_socket -p 55432 -U transport_user -d transport_analytics -c "SELECT COUNT(*) FROM dm.batch_metrics;"
 ```
 
+## Режимы запуска
+Все команды запуска, live viewer, streaming, batch и калибровка параметров вынесены в [RUN_MODES.md](/home/courage/Рабочий стол/CODEX/RUN_MODES.md).
+
 ## Ограничения
-- скорость по видео считается как proxy
-- качество детекции зависит от камеры
+- качество детекции зависит от сцены и мощности машины
+- live viewer на CPU при плотном потоке может терять часть объектов
 - стабильность live зависит от доступности потока и `ffmpeg/yt-dlp`
 - исторический CSV не является готовой train-разметкой для YOLO

@@ -75,6 +75,8 @@ class ViewerTuning:
     reid_distance_px: float = 180.0
     min_track_hits: int = 2
     edge_min_track_hits: int = 1
+    person_min_track_hits: int = 3
+    person_min_duration_seconds: float = 0.35
     static_duration_seconds: float = 6.0
     static_movement_px: float = 20.0
     static_min_hits: int = 10
@@ -83,12 +85,47 @@ class ViewerTuning:
     speed_kmh_factor: float = 0.18
     speed_window_seconds: float = 2.0
     speed_max_jump_ratio: float = 2.4
+    speed_reset_gap_seconds: float = 0.7
+    speed_max_kmh_estimated: float = 160.0
+    ghost_zone_min_hits: int = 6
+    ghost_zone_window_seconds: float = 20.0
+    ghost_zone_radius_px: float = 45.0
 
 
 def _class_family(vehicle_class: str) -> str:
     if vehicle_class in {"car", "truck", "bus", "motorcycle"}:
         return "vehicle"
     return vehicle_class
+
+
+def _should_upgrade_counted_class(old_class: str | None, new_class: str) -> bool:
+    if not old_class or old_class == new_class:
+        return False
+    rank = {
+        "car": 1,
+        "truck": 2,
+        "bus": 3,
+    }
+    if old_class in rank and new_class in rank:
+        return rank[new_class] > rank[old_class]
+    return False
+
+
+def _reclassify_counted_track(
+    state: LiveTrackState,
+    lifetime_track_counts: Counter[str],
+) -> None:
+    if not state.counted:
+        return
+    if not _should_upgrade_counted_class(state.counted_class, state.stable_class):
+        return
+    previous_class = state.counted_class
+    if previous_class and lifetime_track_counts.get(previous_class, 0) > 0:
+        lifetime_track_counts[previous_class] -= 1
+        if lifetime_track_counts[previous_class] <= 0:
+            del lifetime_track_counts[previous_class]
+    state.counted_class = state.stable_class
+    lifetime_track_counts[state.counted_class] += 1
 
 
 def _resolve_stable_class(state: LiveTrackState) -> str:
@@ -175,15 +212,108 @@ def _top_speed_track(track_states: dict[str, LiveTrackState]) -> LiveTrackState 
     return max(candidates, key=lambda state: state.speed_px_per_sec)
 
 
+def _zone_distance(a: dict[str, float], x: float, y: float) -> float:
+    return ((a["cx"] - x) ** 2 + (a["cy"] - y) ** 2) ** 0.5
+
+
+def _register_false_hotspot(
+    state: LiveTrackState,
+    hotspot_candidates: list[dict[str, float | str]],
+    suppression_zones: list[dict[str, float | str]],
+    now_ts: float,
+    tuning: ViewerTuning,
+) -> None:
+    if tuning.ghost_zone_min_hits <= 0:
+        return
+    hits = sum(state.class_votes.values())
+    duration = state.last_seen - state.first_seen
+    displacement = (
+        (state.centroid_x - state.first_centroid_x) ** 2 + (state.centroid_y - state.first_centroid_y) ** 2
+    ) ** 0.5
+    target_family = "person" if state.stable_class == "person" else _class_family(state.stable_class)
+    if target_family not in {"person", "vehicle"}:
+        return
+    if state.counted:
+        return
+    if hits > max(tuning.person_min_track_hits, 4):
+        return
+    if duration > max(tuning.person_min_duration_seconds, 0.8):
+        return
+    if displacement > tuning.static_movement_px:
+        return
+
+    cx = state.centroid_x
+    cy = state.centroid_y
+    matched = None
+    for zone in hotspot_candidates:
+        if zone["target_family"] != target_family:
+            continue
+        if _zone_distance(zone, cx, cy) <= tuning.ghost_zone_radius_px:
+            matched = zone
+            break
+    if matched is None:
+        hotspot_candidates.append(
+            {
+                "cx": cx,
+                "cy": cy,
+                "hits": 1.0,
+                "first_seen": now_ts,
+                "last_seen": now_ts,
+                "x1": state.bbox_x1,
+                "y1": state.bbox_y1,
+                "x2": state.bbox_x2,
+                "y2": state.bbox_y2,
+                "target_family": target_family,
+            }
+        )
+        return
+
+    matched["cx"] = (float(matched["cx"]) * float(matched["hits"]) + cx) / (float(matched["hits"]) + 1.0)
+    matched["cy"] = (float(matched["cy"]) * float(matched["hits"]) + cy) / (float(matched["hits"]) + 1.0)
+    matched["hits"] = float(matched["hits"]) + 1.0
+    matched["last_seen"] = now_ts
+    matched["x1"] = min(float(matched["x1"]), state.bbox_x1)
+    matched["y1"] = min(float(matched["y1"]), state.bbox_y1)
+    matched["x2"] = max(float(matched["x2"]), state.bbox_x2)
+    matched["y2"] = max(float(matched["y2"]), state.bbox_y2)
+
+    if float(matched["hits"]) < tuning.ghost_zone_min_hits:
+        return
+    exists = any(
+        zone.get("target_family") == target_family and _zone_distance(zone, float(matched["cx"]), float(matched["cy"])) <= tuning.ghost_zone_radius_px
+        for zone in suppression_zones
+    )
+    if exists:
+        return
+    suppression_zones.append(
+        {
+            "x1": float(matched["x1"]) - tuning.suppression_padding_px,
+            "y1": float(matched["y1"]) - tuning.suppression_padding_px,
+            "x2": float(matched["x2"]) + tuning.suppression_padding_px,
+            "y2": float(matched["y2"]) + tuning.suppression_padding_px,
+            "cx": float(matched["cx"]),
+            "cy": float(matched["cy"]),
+            "target_family": target_family,
+        }
+    )
+
+
 def _update_track_speed(state: LiveTrackState, now_ts: float, tuning: ViewerTuning) -> None:
+    gap_seconds = now_ts - state.last_seen
+    if gap_seconds > tuning.speed_reset_gap_seconds:
+        state.position_history.clear()
+        state.speed_samples.clear()
+        state.speed_px_per_sec = 0.0
+        state.speed_kmh_estimated = 0.0
+
     state.position_history.append((now_ts, state.centroid_x, state.centroid_y))
     cutoff = now_ts - tuning.speed_window_seconds
     while len(state.position_history) > 2 and state.position_history[0][0] < cutoff:
         state.position_history.popleft()
 
     instant_speed: float | None = None
-    if now_ts > state.last_seen:
-        dt = now_ts - state.last_seen
+    if now_ts > state.last_seen and gap_seconds <= tuning.speed_reset_gap_seconds:
+        dt = gap_seconds
         if dt > 0:
             instant_speed = (
                 ((state.centroid_x - state.prev_centroid_x) ** 2 + (state.centroid_y - state.prev_centroid_y) ** 2) ** 0.5
@@ -215,6 +345,17 @@ def _update_track_speed(state: LiveTrackState, now_ts: float, tuning: ViewerTuni
     else:
         state.speed_px_per_sec = (alpha * sample_median) + ((1 - alpha) * state.speed_px_per_sec)
     state.speed_kmh_estimated = state.speed_px_per_sec * tuning.speed_kmh_factor
+    state.speed_kmh_estimated = min(state.speed_kmh_estimated, tuning.speed_max_kmh_estimated)
+
+
+def _should_count_track(state: LiveTrackState, hits: int, tuning: ViewerTuning) -> bool:
+    stable_class = state.stable_class
+    duration = state.last_seen - state.first_seen
+    if stable_class == "person":
+        required_hits = tuning.person_min_track_hits
+        return hits >= required_hits and duration >= tuning.person_min_duration_seconds
+    required_hits = tuning.edge_min_track_hits if state.touches_edge else tuning.min_track_hits
+    return hits >= required_hits
 
 
 def _row_center_in_zone(row: dict[str, object], zone: dict[str, float]) -> bool:
@@ -228,7 +369,16 @@ def _apply_suppression_zones(rows: list[dict[str, object]], suppression_zones: l
         return rows
     filtered: list[dict[str, object]] = []
     for row in rows:
-        if any(_row_center_in_zone(row, zone) for zone in suppression_zones):
+        suppressed = False
+        row_family = _class_family(str(row["vehicle_class"]))
+        for zone in suppression_zones:
+            target_family = str(zone.get("target_family", ""))
+            if target_family and target_family != row_family:
+                continue
+            if _row_center_in_zone(row, zone):
+                suppressed = True
+                break
+        if suppressed:
             continue
         filtered.append(row)
     return filtered
@@ -304,6 +454,7 @@ def _update_track_states(
     rows: list[dict[str, object]],
     track_states: dict[str, LiveTrackState],
     retired_track_states: dict[str, LiveTrackState],
+    hotspot_candidates: list[dict[str, float | str]],
     local_to_global: dict[str, str],
     next_track_index: int,
     now_ts: float,
@@ -315,6 +466,8 @@ def _update_track_states(
         state = track_states.pop(track_id)
         if state.counted:
             retired_track_states[track_id] = state
+        else:
+            _register_false_hotspot(state, hotspot_candidates, suppression_zones, now_ts, tuning)
 
     expired_retired_ids = [
         track_id for track_id, state in retired_track_states.items() if now_ts - state.last_seen > tuning.reid_memory_seconds
@@ -393,7 +546,7 @@ def _update_track_states(
 
         hits = sum(state.class_votes.values())
         if not state.counted:
-            if hits >= tuning.min_track_hits or (state.touches_edge and hits >= tuning.edge_min_track_hits):
+            if _should_count_track(state, hits, tuning):
                 state.counted = True
                 state.counted_class = state.stable_class
         duration = state.last_seen - state.first_seen
@@ -623,6 +776,8 @@ def run() -> None:
     parser.add_argument("--reid-distance-px", type=float, default=None)
     parser.add_argument("--min-track-hits", type=int, default=None)
     parser.add_argument("--edge-min-track-hits", type=int, default=None)
+    parser.add_argument("--person-min-track-hits", type=int, default=None)
+    parser.add_argument("--person-min-duration-seconds", type=float, default=None)
     parser.add_argument("--static-duration-seconds", type=float, default=None)
     parser.add_argument("--static-movement-px", type=float, default=None)
     parser.add_argument("--static-min-hits", type=int, default=None)
@@ -631,6 +786,11 @@ def run() -> None:
     parser.add_argument("--speed-kmh-factor", type=float, default=None)
     parser.add_argument("--speed-window-seconds", type=float, default=None)
     parser.add_argument("--speed-max-jump-ratio", type=float, default=None)
+    parser.add_argument("--speed-reset-gap-seconds", type=float, default=None)
+    parser.add_argument("--speed-max-kmh-estimated", type=float, default=None)
+    parser.add_argument("--ghost-zone-min-hits", type=int, default=None)
+    parser.add_argument("--ghost-zone-window-seconds", type=float, default=None)
+    parser.add_argument("--ghost-zone-radius-px", type=float, default=None)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -653,10 +813,17 @@ def run() -> None:
         tuning.reid_distance_px = 220.0
         tuning.min_track_hits = 1
         tuning.edge_min_track_hits = 1
+        tuning.person_min_track_hits = 3
+        tuning.person_min_duration_seconds = 0.35
         tuning.static_duration_seconds = 8.0
         tuning.static_movement_px = 24.0
         tuning.static_min_hits = 14
         tuning.overlap_iou_threshold = 0.60
+        tuning.speed_reset_gap_seconds = 0.6
+        tuning.speed_max_kmh_estimated = 140.0
+        tuning.ghost_zone_min_hits = 0
+        tuning.ghost_zone_window_seconds = 20.0
+        tuning.ghost_zone_radius_px = 45.0
     if args.overlap_iou is not None:
         tuning.overlap_iou_threshold = args.overlap_iou
     if args.track_stale_seconds is not None:
@@ -675,6 +842,10 @@ def run() -> None:
         tuning.min_track_hits = args.min_track_hits
     if args.edge_min_track_hits is not None:
         tuning.edge_min_track_hits = args.edge_min_track_hits
+    if args.person_min_track_hits is not None:
+        tuning.person_min_track_hits = args.person_min_track_hits
+    if args.person_min_duration_seconds is not None:
+        tuning.person_min_duration_seconds = args.person_min_duration_seconds
     if args.static_duration_seconds is not None:
         tuning.static_duration_seconds = args.static_duration_seconds
     if args.static_movement_px is not None:
@@ -691,6 +862,16 @@ def run() -> None:
         tuning.speed_window_seconds = args.speed_window_seconds
     if args.speed_max_jump_ratio is not None:
         tuning.speed_max_jump_ratio = args.speed_max_jump_ratio
+    if args.speed_reset_gap_seconds is not None:
+        tuning.speed_reset_gap_seconds = args.speed_reset_gap_seconds
+    if args.speed_max_kmh_estimated is not None:
+        tuning.speed_max_kmh_estimated = args.speed_max_kmh_estimated
+    if args.ghost_zone_min_hits is not None:
+        tuning.ghost_zone_min_hits = args.ghost_zone_min_hits
+    if args.ghost_zone_window_seconds is not None:
+        tuning.ghost_zone_window_seconds = args.ghost_zone_window_seconds
+    if args.ghost_zone_radius_px is not None:
+        tuning.ghost_zone_radius_px = args.ghost_zone_radius_px
     request = resolve_validated_media_request(args.source)
     if request is None:
         raise RuntimeError(f"Unable to resolve a playable stream from {args.source}")
@@ -726,6 +907,7 @@ def run() -> None:
     next_track_index = 1
     recent_entries: deque[tuple[float, str]] = deque()
     suppression_zones: list[dict[str, float]] = []
+    ghost_zone_candidates: list[dict[str, float | str]] = []
     lifetime_track_counts: Counter[str] = Counter()
     use_opencv_window = False
     ffplay_sink: subprocess.Popen[bytes] | None = None
@@ -747,7 +929,7 @@ def run() -> None:
             LOGGER.info("viewer renderer | ffplay")
 
     LOGGER.info(
-        "viewer tuning | fps=%s imgsz=%s conf=%.2f overlap_iou=%.2f stale=%.1fs stitch_gap=%.1fs stitch_dist=%.1f stitch_min_iou=%.2f reid_memory=%.1fs reid_dist=%.1f min_hits=%s edge_hits=%s static_duration=%.1fs static_move=%.1f static_min_hits=%s speed_alpha=%.2f speed_factor=%.3f speed_window=%.1fs speed_jump=%.2f",
+        "viewer tuning | fps=%s imgsz=%s conf=%.2f overlap_iou=%.2f stale=%.1fs stitch_gap=%.1fs stitch_dist=%.1f stitch_min_iou=%.2f reid_memory=%.1fs reid_dist=%.1f min_hits=%s edge_hits=%s person_hits=%s person_duration=%.2fs static_duration=%.1fs static_move=%.1f static_min_hits=%s speed_alpha=%.2f speed_factor=%.3f speed_window=%.1fs speed_jump=%.2f speed_reset=%.2fs speed_cap=%.1f ghost_hits=%s ghost_window=%.1fs ghost_radius=%.1f",
         settings.stream_target_fps,
         settings.yolo_imgsz,
         settings.yolo_confidence,
@@ -760,6 +942,8 @@ def run() -> None:
         tuning.reid_distance_px,
         tuning.min_track_hits,
         tuning.edge_min_track_hits,
+        tuning.person_min_track_hits,
+        tuning.person_min_duration_seconds,
         tuning.static_duration_seconds,
         tuning.static_movement_px,
         tuning.static_min_hits,
@@ -767,6 +951,11 @@ def run() -> None:
         tuning.speed_kmh_factor,
         tuning.speed_window_seconds,
         tuning.speed_max_jump_ratio,
+        tuning.speed_reset_gap_seconds,
+        tuning.speed_max_kmh_estimated,
+        tuning.ghost_zone_min_hits,
+        tuning.ghost_zone_window_seconds,
+        tuning.ghost_zone_radius_px,
     )
 
     try:
@@ -815,6 +1004,7 @@ def run() -> None:
                             "centroid_y": (y1 + y2) / 2.0,
                             "touches_edge": x1 <= 8 or x2 >= output_width - 8 or y1 <= 8 or y2 >= output_height - 8,
                             "frame_area": float(output_width * output_height),
+                            "frame_height": float(output_height),
                         }
                     )
 
@@ -831,6 +1021,7 @@ def run() -> None:
                 frame_rows,
                 track_states,
                 retired_track_states,
+                ghost_zone_candidates,
                 local_to_global,
                 next_track_index,
                 now_ts,
@@ -840,6 +1031,7 @@ def run() -> None:
             active_track_counts = _stable_track_counts(track_states)
             frame_class_counts = Counter(str(row["vehicle_class"]) for row in frame_rows)
             for state in track_states.values():
+                _reclassify_counted_track(state, lifetime_track_counts)
                 if state.counted and state.global_track_id not in before_counted:
                     counted_class = state.counted_class or state.stable_class
                     recent_entries.append((now_ts, counted_class))
