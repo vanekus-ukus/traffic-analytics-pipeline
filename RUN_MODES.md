@@ -109,6 +109,102 @@ bash scripts/run_live_view.sh \
 bash scripts/run_live_view.sh --source "<video_or_stream_source>" --renderer ffplay
 ```
 
+## Типичные проблемы
+
+### `bus` и `truck` путаются
+Обычно это происходит, когда крупный транспорт сначала виден далеко или частично, а трек слишком рано теряет историю.
+
+Что помогает:
+- увеличить `--imgsz`
+- увеличить `--track-stale-seconds`
+- увеличить `--stitch-gap-seconds`
+- увеличить `--reid-memory-seconds`
+- не ставить слишком высокий `--confidence`
+
+Пример:
+```bash
+bash scripts/run_live_view.sh \
+  --source "<video_or_stream_source>" \
+  --scene-preset fast_road \
+  --imgsz 896 \
+  --confidence 0.18 \
+  --track-stale-seconds 7 \
+  --stitch-gap-seconds 5 \
+  --stitch-distance-px 180 \
+  --stitch-min-iou 0.04 \
+  --reid-memory-seconds 30 \
+  --reid-distance-px 240 \
+  --renderer ffplay \
+  --log-level INFO
+```
+
+### Метки моргают, часть машин не считается
+Обычно это нехватка вычислений или слишком жёсткая сшивка треков.
+
+Что помогает:
+- уменьшить `--target-fps`
+- уменьшить `--imgsz`
+- увеличить `--track-stale-seconds`
+- увеличить `--reid-memory-seconds`
+- уменьшить `--stitch-distance-px`, если разные машины слипаются в один трек
+
+Пример:
+```bash
+bash scripts/run_live_view.sh \
+  --source "<video_or_stream_source>" \
+  --target-fps 8 \
+  --imgsz 640 \
+  --track-stale-seconds 6 \
+  --stitch-gap-seconds 4 \
+  --stitch-distance-px 140 \
+  --reid-memory-seconds 20 \
+  --reid-distance-px 180 \
+  --renderer ffplay \
+  --log-level INFO
+```
+
+### Ложные `person` или `car` на статичных объектах
+Обычно это повторяющиеся короткие ложные треки на фоне или конструкции рядом с дорогой.
+
+Что помогает:
+- увеличить `--person-min-track-hits`
+- увеличить `--person-min-duration-seconds`
+- увеличить `--static-duration-seconds`
+- увеличить `--static-min-hits`
+
+Пример:
+```bash
+bash scripts/run_live_view.sh \
+  --source "<video_or_stream_source>" \
+  --person-min-track-hits 4 \
+  --person-min-duration-seconds 0.50 \
+  --static-duration-seconds 10 \
+  --static-min-hits 18 \
+  --renderer ffplay \
+  --log-level INFO
+```
+
+### Скорость иногда скачет слишком сильно
+Обычно это происходит после потери трека и повторного появления объекта.
+
+Что помогает:
+- уменьшить `--speed-max-jump-ratio`
+- уменьшить `--speed-reset-gap-seconds`
+- уменьшить `--speed-max-kmh-estimated`
+- увеличить `--speed-window-seconds`
+
+Пример:
+```bash
+bash scripts/run_live_view.sh \
+  --source "<video_or_stream_source>" \
+  --speed-window-seconds 2.5 \
+  --speed-max-jump-ratio 1.8 \
+  --speed-reset-gap-seconds 0.4 \
+  --speed-max-kmh-estimated 110 \
+  --renderer ffplay \
+  --log-level INFO
+```
+
 ## Полный запуск
 ```bash
 bash scripts/run_all.sh
