@@ -20,6 +20,7 @@ from traffic_analytics.streaming.video_source import MediaRequest, resolve_valid
 from traffic_analytics.streaming.yolo_backend import COCO_TARGETS, VEHICLE_CLASSES
 
 LOGGER = logging.getLogger(__name__)
+PANEL_WIDTH = 420
 
 
 @dataclass
@@ -28,6 +29,8 @@ class LiveTrackState:
     local_track_id: str | None
     first_seen: float
     last_seen: float
+    first_centroid_x: float
+    first_centroid_y: float
     prev_centroid_x: float
     prev_centroid_y: float
     centroid_x: float
@@ -38,12 +41,14 @@ class LiveTrackState:
     bbox_y2: float
     touches_edge: bool
     class_votes: Counter[str] = field(default_factory=Counter)
+    class_history: deque[tuple[str, float, float]] = field(default_factory=lambda: deque(maxlen=24))
     counted: bool = False
+    counted_class: str | None = None
     suppressed: bool = False
 
     @property
     def stable_class(self) -> str:
-        return self.class_votes.most_common(1)[0][0] if self.class_votes else "unknown"
+        return _resolve_stable_class(self)
 
 
 def _apply_scene_preset(settings, preset: str) -> None:
@@ -61,10 +66,14 @@ class ViewerTuning:
     track_stale_seconds: float = 3.0
     stitch_gap_seconds: float = 1.5
     stitch_distance_px: float = 120.0
+    stitch_min_iou: float = 0.02
+    reid_memory_seconds: float = 12.0
+    reid_distance_px: float = 180.0
     min_track_hits: int = 2
     edge_min_track_hits: int = 1
-    static_duration_seconds: float = 2.0
-    static_movement_px: float = 4.0
+    static_duration_seconds: float = 6.0
+    static_movement_px: float = 20.0
+    static_min_hits: int = 10
     suppression_padding_px: float = 20.0
 
 
@@ -72,6 +81,34 @@ def _class_family(vehicle_class: str) -> str:
     if vehicle_class in {"car", "truck", "bus", "motorcycle"}:
         return "vehicle"
     return vehicle_class
+
+
+def _resolve_stable_class(state: LiveTrackState) -> str:
+    if not state.class_history:
+        return state.class_votes.most_common(1)[0][0] if state.class_votes else "unknown"
+
+    weighted_scores: Counter[str] = Counter()
+    for idx, (vehicle_class, confidence, area_ratio) in enumerate(state.class_history, start=1):
+        recency_weight = 0.55 + (idx / len(state.class_history))
+        size_weight = 1.0 + min(area_ratio * 45.0, 2.5)
+        confidence_weight = max(0.35, confidence)
+        weighted_scores[vehicle_class] += recency_weight * size_weight * confidence_weight
+
+    current_class = weighted_scores.most_common(1)[0][0]
+    vehicle_scores = {
+        cls: weighted_scores.get(cls, 0.0)
+        for cls in ("car", "truck", "bus", "motorcycle")
+        if weighted_scores.get(cls, 0.0) > 0
+    }
+    if vehicle_scores:
+        dominant_vehicle_class = max(vehicle_scores, key=vehicle_scores.get)
+        dominant_score = vehicle_scores[dominant_vehicle_class]
+        car_score = vehicle_scores.get("car", 0.0)
+        if dominant_vehicle_class in {"bus", "truck"} and dominant_score >= max(car_score * 0.85, 2.0):
+            return dominant_vehicle_class
+        if dominant_vehicle_class == "motorcycle" and dominant_score >= max(car_score * 1.05, 1.5):
+            return dominant_vehicle_class
+    return current_class
 
 
 def _iou(a: dict[str, object], b: dict[str, object]) -> float:
@@ -90,14 +127,24 @@ def _iou(a: dict[str, object], b: dict[str, object]) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _state_row_iou(state: LiveTrackState, row: dict[str, object]) -> float:
+    state_box = {
+        "bbox_x1": state.bbox_x1,
+        "bbox_y1": state.bbox_y1,
+        "bbox_x2": state.bbox_x2,
+        "bbox_y2": state.bbox_y2,
+    }
+    return _iou(state_box, row)
+
+
 def _suppress_overlaps(rows: list[dict[str, object]], overlap_iou_threshold: float) -> list[dict[str, object]]:
     ordered = sorted(rows, key=lambda row: float(row["confidence"]), reverse=True)
     kept: list[dict[str, object]] = []
     for row in ordered:
         drop = False
         for kept_row in kept:
-            same_family = _class_family(str(row["vehicle_class"])) == _class_family(str(kept_row["vehicle_class"]))
-            if same_family and _iou(row, kept_row) >= overlap_iou_threshold:
+            same_class = str(row["vehicle_class"]) == str(kept_row["vehicle_class"])
+            if same_class and _iou(row, kept_row) >= overlap_iou_threshold:
                 drop = True
                 break
         if not drop:
@@ -133,22 +180,31 @@ def _apply_suppression_zones(rows: list[dict[str, object]], suppression_zones: l
 def _assign_global_track(
     row: dict[str, object],
     track_states: dict[str, LiveTrackState],
+    retired_track_states: dict[str, LiveTrackState],
     local_to_global: dict[str, str],
+    blocked_global_ids: set[str],
     now_ts: float,
     next_track_index: int,
     max_gap_seconds: float,
     max_distance_px: float,
+    min_iou: float,
+    reid_memory_seconds: float,
+    reid_distance_px: float,
 ) -> tuple[str, int]:
     local_track_id = row.get("track_id")
     if local_track_id and local_track_id in local_to_global:
-        return local_to_global[local_track_id], next_track_index
+        mapped_id = local_to_global[local_track_id]
+        if mapped_id not in blocked_global_ids:
+            return mapped_id, next_track_index
 
     family = _class_family(str(row["vehicle_class"]))
     cx = float(row["centroid_x"])
     cy = float(row["centroid_y"])
     best_id: str | None = None
-    best_distance: float | None = None
+    best_score: tuple[float, float] | None = None
     for global_id, state in track_states.items():
+        if global_id in blocked_global_ids:
+            continue
         if now_ts - state.last_seen > max_gap_seconds:
             continue
         if _class_family(state.stable_class) != family:
@@ -156,9 +212,28 @@ def _assign_global_track(
         distance = ((state.centroid_x - cx) ** 2 + (state.centroid_y - cy) ** 2) ** 0.5
         if distance > max_distance_px:
             continue
-        if best_distance is None or distance < best_distance:
-            best_distance = distance
+        bbox_iou = _state_row_iou(state, row)
+        if bbox_iou < min_iou and distance > max_distance_px * 0.55:
+            continue
+        score = (bbox_iou, -distance)
+        if best_score is None or score > best_score:
+            best_score = score
             best_id = global_id
+
+    if best_id is None:
+        for global_id, state in retired_track_states.items():
+            if now_ts - state.last_seen > reid_memory_seconds:
+                continue
+            if _class_family(state.stable_class) != family:
+                continue
+            distance = ((state.centroid_x - cx) ** 2 + (state.centroid_y - cy) ** 2) ** 0.5
+            if distance > reid_distance_px:
+                continue
+            bbox_iou = _state_row_iou(state, row)
+            score = (bbox_iou, -distance)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_id = global_id
 
     if best_id is None:
         best_id = f"live_view_{next_track_index:08d}"
@@ -171,6 +246,7 @@ def _assign_global_track(
 def _update_track_states(
     rows: list[dict[str, object]],
     track_states: dict[str, LiveTrackState],
+    retired_track_states: dict[str, LiveTrackState],
     local_to_global: dict[str, str],
     next_track_index: int,
     now_ts: float,
@@ -179,38 +255,59 @@ def _update_track_states(
 ) -> int:
     stale_ids = [track_id for track_id, state in track_states.items() if now_ts - state.last_seen > tuning.track_stale_seconds]
     for track_id in stale_ids:
-        del track_states[track_id]
-    stale_local = [local_id for local_id, global_id in local_to_global.items() if global_id not in track_states]
+        state = track_states.pop(track_id)
+        if state.counted:
+            retired_track_states[track_id] = state
+
+    expired_retired_ids = [
+        track_id for track_id, state in retired_track_states.items() if now_ts - state.last_seen > tuning.reid_memory_seconds
+    ]
+    for track_id in expired_retired_ids:
+        del retired_track_states[track_id]
+
+    known_ids = set(track_states) | set(retired_track_states)
+    stale_local = [local_id for local_id, global_id in local_to_global.items() if global_id not in known_ids]
     for local_id in stale_local:
         del local_to_global[local_id]
 
+    assigned_global_ids: set[str] = set()
     for row in rows:
         global_id, next_track_index = _assign_global_track(
             row,
             track_states,
+            retired_track_states,
             local_to_global,
+            assigned_global_ids,
             now_ts,
             next_track_index,
             max_gap_seconds=tuning.stitch_gap_seconds,
             max_distance_px=tuning.stitch_distance_px,
+            min_iou=tuning.stitch_min_iou,
+            reid_memory_seconds=tuning.reid_memory_seconds,
+            reid_distance_px=tuning.reid_distance_px,
         )
+        assigned_global_ids.add(global_id)
         state = track_states.get(global_id)
         if state is None:
-            state = LiveTrackState(
-                global_track_id=global_id,
-                local_track_id=row.get("track_id"),
-                first_seen=now_ts,
-                last_seen=now_ts,
-                prev_centroid_x=float(row["centroid_x"]),
-                prev_centroid_y=float(row["centroid_y"]),
-                centroid_x=float(row["centroid_x"]),
-                centroid_y=float(row["centroid_y"]),
-                bbox_x1=float(row["bbox_x1"]),
-                bbox_y1=float(row["bbox_y1"]),
-                bbox_x2=float(row["bbox_x2"]),
-                bbox_y2=float(row["bbox_y2"]),
-                touches_edge=bool(row.get("touches_edge")),
-            )
+            state = retired_track_states.pop(global_id, None)
+            if state is None:
+                state = LiveTrackState(
+                    global_track_id=global_id,
+                    local_track_id=row.get("track_id"),
+                    first_seen=now_ts,
+                    last_seen=now_ts,
+                    first_centroid_x=float(row["centroid_x"]),
+                    first_centroid_y=float(row["centroid_y"]),
+                    prev_centroid_x=float(row["centroid_x"]),
+                    prev_centroid_y=float(row["centroid_y"]),
+                    centroid_x=float(row["centroid_x"]),
+                    centroid_y=float(row["centroid_y"]),
+                    bbox_x1=float(row["bbox_x1"]),
+                    bbox_y1=float(row["bbox_y1"]),
+                    bbox_x2=float(row["bbox_x2"]),
+                    bbox_y2=float(row["bbox_y2"]),
+                    touches_edge=bool(row.get("touches_edge")),
+                )
             track_states[global_id] = state
         state.local_track_id = row.get("track_id")
         state.last_seen = now_ts
@@ -224,6 +321,12 @@ def _update_track_states(
         state.bbox_y2 = float(row["bbox_y2"])
         state.touches_edge = state.touches_edge or bool(row.get("touches_edge"))
         state.class_votes[str(row["vehicle_class"])] += 1
+        bbox_area_ratio = max(
+            0.0,
+            ((state.bbox_x2 - state.bbox_x1) * (state.bbox_y2 - state.bbox_y1))
+            / max(float(row.get("frame_area", 1.0)), 1.0),
+        )
+        state.class_history.append((str(row["vehicle_class"]), float(row["confidence"]), bbox_area_ratio))
         row["stable_track_id"] = global_id
         row["vehicle_class"] = state.stable_class
 
@@ -231,14 +334,18 @@ def _update_track_states(
         if not state.counted:
             if hits >= tuning.min_track_hits or (state.touches_edge and hits >= tuning.edge_min_track_hits):
                 state.counted = True
+                state.counted_class = state.stable_class
         duration = state.last_seen - state.first_seen
-        movement = ((state.centroid_x - state.prev_centroid_x) ** 2 + (state.centroid_y - state.prev_centroid_y) ** 2) ** 0.5
+        total_displacement = (
+            (state.centroid_x - state.first_centroid_x) ** 2 + (state.centroid_y - state.first_centroid_y) ** 2
+        ) ** 0.5
         if (
             not state.suppressed
             and state.counted
             and _class_family(state.stable_class) == "vehicle"
             and duration >= tuning.static_duration_seconds
-            and movement <= tuning.static_movement_px
+            and hits >= tuning.static_min_hits
+            and total_displacement <= tuning.static_movement_px
         ):
             suppression_zones.append(
                 {
@@ -338,33 +445,44 @@ def _draw_frame(
             cv2.LINE_AA,
         )
 
-    panel_width = 360
-    canvas = np.zeros((output.shape[0], output.shape[1] + panel_width, 3), dtype=np.uint8)
+    canvas = np.zeros((output.shape[0], output.shape[1] + PANEL_WIDTH, 3), dtype=np.uint8)
     canvas[:, : output.shape[1], :] = output
     canvas[:, output.shape[1] :, :] = (25, 25, 25)
 
-    frame_stats = ", ".join(f"{name}={value}" for name, value in sorted(frame_class_counts.items())) or "-"
-    active_stats = ", ".join(f"{name}={value}" for name, value in sorted(active_track_counts.items())) or "-"
-    lifetime_stats = ", ".join(f"{name}={value}" for name, value in sorted(lifetime_track_counts.items())) or "-"
-    recent_stats = ", ".join(f"{name}={value}" for name, value in sorted(recent_entry_counts.items())) or "-"
-
     x0 = output.shape[1] + 20
-    lines = [
-        f"model={model_name}",
-        f"frame_counts: {frame_stats}",
-        f"active_tracks: {active_stats}",
-        f"lifetime_tracks: {lifetime_stats}",
-        f"new_last_10s: {recent_stats}",
-    ]
-    for idx, text in enumerate(lines):
-        y = 40 + idx * 34
-        cv2.putText(canvas, text, (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+    cv2.putText(canvas, f"model={model_name}", (x0, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+    classes = ["car", "truck", "bus", "motorcycle", "bicycle", "person"]
+    table_top = 64
+    row_h = 34
+    col_class = x0
+    col_frame = x0 + 130
+    col_active = x0 + 205
+    col_total = x0 + 290
+
+    cv2.putText(canvas, "class", (col_class, table_top), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (180, 220, 255), 2)
+    cv2.putText(canvas, "frame", (col_frame, table_top), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (180, 220, 255), 2)
+    cv2.putText(canvas, "active", (col_active, table_top), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (180, 220, 255), 2)
+    cv2.putText(canvas, "total", (col_total, table_top), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (180, 220, 255), 2)
+    cv2.line(canvas, (x0, table_top + 10), (output.shape[1] + PANEL_WIDTH - 20, table_top + 10), (70, 70, 70), 1)
+
+    for idx, cls in enumerate(classes, start=1):
+        y = table_top + idx * row_h
+        cv2.putText(canvas, cls, (col_class, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(canvas, str(frame_class_counts.get(cls, 0)), (col_frame, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(canvas, str(active_track_counts.get(cls, 0)), (col_active, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(canvas, str(lifetime_track_counts.get(cls, 0)), (col_total, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+    recent_top = table_top + (len(classes) + 2) * row_h
+    cv2.putText(canvas, "new_last_10s", (x0, recent_top), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (180, 220, 255), 2)
+    for idx, cls in enumerate(classes, start=1):
+        y = recent_top + idx * 28
+        cv2.putText(canvas, f"{cls}: {recent_entry_counts.get(cls, 0)}", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
     return canvas
 
 
 def _rendered_frame_size(frame_width: int, frame_height: int) -> tuple[int, int]:
-    panel_width = 360
-    return frame_width + panel_width, frame_height
+    return frame_width + PANEL_WIDTH, frame_height
 
 
 def _filter_rows(
@@ -414,10 +532,14 @@ def run() -> None:
     parser.add_argument("--track-stale-seconds", type=float, default=None)
     parser.add_argument("--stitch-gap-seconds", type=float, default=None)
     parser.add_argument("--stitch-distance-px", type=float, default=None)
+    parser.add_argument("--stitch-min-iou", type=float, default=None)
+    parser.add_argument("--reid-memory-seconds", type=float, default=None)
+    parser.add_argument("--reid-distance-px", type=float, default=None)
     parser.add_argument("--min-track-hits", type=int, default=None)
     parser.add_argument("--edge-min-track-hits", type=int, default=None)
     parser.add_argument("--static-duration-seconds", type=float, default=None)
     parser.add_argument("--static-movement-px", type=float, default=None)
+    parser.add_argument("--static-min-hits", type=int, default=None)
     parser.add_argument("--suppression-padding-px", type=float, default=None)
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
@@ -435,11 +557,15 @@ def run() -> None:
     if args.scene_preset == "fast_road":
         tuning.track_stale_seconds = 4.0
         tuning.stitch_gap_seconds = 2.5
-        tuning.stitch_distance_px = 220.0
-        tuning.min_track_hits = 2
+        tuning.stitch_distance_px = 160.0
+        tuning.stitch_min_iou = 0.04
+        tuning.reid_memory_seconds = 15.0
+        tuning.reid_distance_px = 220.0
+        tuning.min_track_hits = 1
         tuning.edge_min_track_hits = 1
-        tuning.static_duration_seconds = 2.0
-        tuning.static_movement_px = 4.0
+        tuning.static_duration_seconds = 8.0
+        tuning.static_movement_px = 24.0
+        tuning.static_min_hits = 14
         tuning.overlap_iou_threshold = 0.60
     if args.overlap_iou is not None:
         tuning.overlap_iou_threshold = args.overlap_iou
@@ -449,6 +575,12 @@ def run() -> None:
         tuning.stitch_gap_seconds = args.stitch_gap_seconds
     if args.stitch_distance_px is not None:
         tuning.stitch_distance_px = args.stitch_distance_px
+    if args.stitch_min_iou is not None:
+        tuning.stitch_min_iou = args.stitch_min_iou
+    if args.reid_memory_seconds is not None:
+        tuning.reid_memory_seconds = args.reid_memory_seconds
+    if args.reid_distance_px is not None:
+        tuning.reid_distance_px = args.reid_distance_px
     if args.min_track_hits is not None:
         tuning.min_track_hits = args.min_track_hits
     if args.edge_min_track_hits is not None:
@@ -457,6 +589,8 @@ def run() -> None:
         tuning.static_duration_seconds = args.static_duration_seconds
     if args.static_movement_px is not None:
         tuning.static_movement_px = args.static_movement_px
+    if args.static_min_hits is not None:
+        tuning.static_min_hits = args.static_min_hits
     if args.suppression_padding_px is not None:
         tuning.suppression_padding_px = args.suppression_padding_px
     request = resolve_validated_media_request(args.source)
@@ -489,6 +623,7 @@ def run() -> None:
     frame_index = 0
     started = time.monotonic()
     track_states: dict[str, LiveTrackState] = {}
+    retired_track_states: dict[str, LiveTrackState] = {}
     local_to_global: dict[str, str] = {}
     next_track_index = 1
     recent_entries: deque[tuple[float, str]] = deque()
@@ -514,7 +649,7 @@ def run() -> None:
             LOGGER.info("viewer renderer | ffplay")
 
     LOGGER.info(
-        "viewer tuning | fps=%s imgsz=%s conf=%.2f overlap_iou=%.2f stale=%.1fs stitch_gap=%.1fs stitch_dist=%.1f min_hits=%s edge_hits=%s static_duration=%.1fs static_move=%.1f",
+        "viewer tuning | fps=%s imgsz=%s conf=%.2f overlap_iou=%.2f stale=%.1fs stitch_gap=%.1fs stitch_dist=%.1f stitch_min_iou=%.2f reid_memory=%.1fs reid_dist=%.1f min_hits=%s edge_hits=%s static_duration=%.1fs static_move=%.1f static_min_hits=%s",
         settings.stream_target_fps,
         settings.yolo_imgsz,
         settings.yolo_confidence,
@@ -522,10 +657,14 @@ def run() -> None:
         tuning.track_stale_seconds,
         tuning.stitch_gap_seconds,
         tuning.stitch_distance_px,
+        tuning.stitch_min_iou,
+        tuning.reid_memory_seconds,
+        tuning.reid_distance_px,
         tuning.min_track_hits,
         tuning.edge_min_track_hits,
         tuning.static_duration_seconds,
         tuning.static_movement_px,
+        tuning.static_min_hits,
     )
 
     try:
@@ -573,6 +712,7 @@ def run() -> None:
                             "centroid_x": (x1 + x2) / 2.0,
                             "centroid_y": (y1 + y2) / 2.0,
                             "touches_edge": x1 <= 8 or x2 >= output_width - 8 or y1 <= 8 or y2 >= output_height - 8,
+                            "frame_area": float(output_width * output_height),
                         }
                     )
 
@@ -581,13 +721,14 @@ def run() -> None:
             frame_rows = _apply_suppression_zones(frame_rows, suppression_zones)
             before_counted = {
                 state.global_track_id
-                for state in track_states.values()
+                for state in list(track_states.values()) + list(retired_track_states.values())
                 if state.counted
             }
             now_ts = time.monotonic()
             next_track_index = _update_track_states(
                 frame_rows,
                 track_states,
+                retired_track_states,
                 local_to_global,
                 next_track_index,
                 now_ts,
@@ -598,8 +739,9 @@ def run() -> None:
             frame_class_counts = Counter(str(row["vehicle_class"]) for row in frame_rows)
             for state in track_states.values():
                 if state.counted and state.global_track_id not in before_counted:
-                    recent_entries.append((now_ts, state.stable_class))
-                    lifetime_track_counts[state.stable_class] += 1
+                    counted_class = state.counted_class or state.stable_class
+                    recent_entries.append((now_ts, counted_class))
+                    lifetime_track_counts[counted_class] += 1
             cutoff = now_ts - 10.0
             while recent_entries and recent_entries[0][0] < cutoff:
                 recent_entries.popleft()
