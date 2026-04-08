@@ -48,6 +48,10 @@ flowchart LR
     H --> M
 ```
 
+## Пример работы
+
+![Live detection preview](assets/readme/demo-stream.gif)
+
 ## Структура
 - `src/` - код
 - `scripts/` - запуск
