@@ -29,9 +29,8 @@ profiles/live_view/*.json
 assets/readme/*.jpg
 assets/readme/*.png
 assets/readme/*.gif
-!assets/readme/demo-road.jpg
-!assets/readme/demo-live.jpg
 !assets/readme/demo-stream.gif
+!assets/readme/road-zone.jpg
 
 # Private source materials not intended for repo
 /docs/
